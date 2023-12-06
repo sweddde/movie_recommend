@@ -1,9 +1,8 @@
 # .gitignore
+*.log
+*.csv
 .gitattributes
-./movies_dataset/movies_metadata.csv
-./movies_dataset/ratings.csv
-./movies_dataset/links.csv
-./movies_dataset/keywords.csv
+movies_dataset/
 # Editors
 .vscode/
 .idea/
