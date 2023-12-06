@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from pyspark.sql import SparkSession, Window
+from pyspark.sql import Window
 from pyspark.sql.functions import from_json, explode, expr, concat_ws, collect_list, col, split, count, row_number, \
     regexp_replace, broadcast
 from pyspark.sql.types import ArrayType, StructType, StructField, IntegerType, StringType, FloatType
@@ -28,8 +28,7 @@ def dataset_extract(spark):
         return None
 
 
-
-def dataset_transform(keywords, ratings, links, spark):
+def dataset_transform(movies, keywords, ratings, links, spark):
     try:
         # Вызов функции для извлечения данных
         datasets = dataset_extract(spark)
@@ -51,6 +50,7 @@ def dataset_transform(keywords, ratings, links, spark):
         ]))
         # Преобразование строки в массив JSON-объектов
         keywords = keywords.withColumn('keywords_array', from_json('Keywords', json_schema))
+        keywords = keywords.withColumn("id", col("id").cast("integer"))
 
         # Развернуть массив JSON-объектов в отдельные строки
         keywords_exp = keywords.select('id',
@@ -119,39 +119,8 @@ def dataset_transform(keywords, ratings, links, spark):
 
         #################################################################################################
         # Отфильтруем список рекомендаций по высокой оценке остальных пользователей (оценка не ниже 6.5/10)
-        cleaned_movies = movies.withColumn('imdb_id', regexp_replace('imdb_id', '[^0-9]', ''))
-        cleaned_movies1 = cleaned_movies.select(['id', 'original_title', 'vote_average'])
-        cleaned_movies2 = cleaned_movies1.withColumn('vote_average', cleaned_movies1['vote_average'].cast('float'))
-        cleaned_movies3 = cleaned_movies2.withColumn('vote_average',
-                                                     regexp_replace(col('vote_average'), '[^0-9,.]', ''))
-        # Итоговое соединение и фильтрация
-        movies_rec = filtered_common_keywords_limited.join(broadcast(cleaned_movies3),
-                                                           filtered_common_keywords_limited.recommend_id == cleaned_movies3.id,
-                                                           'left')
-        subfinal = movies_rec.select(filtered_common_keywords_limited['id'], 'recommend_id', 'original_title').filter(
-            col('vote_average').cast('float') >= 6.5)
-        final = subfinal.filter(col('vote_average').isNotNull())
-
-        return sorted_common_keywords, user_ratings, final
-    except AnalysisException as e:
-        print(f'Ошибка при трансформации данных: {str(e)}')
-        return None
-
-
-######################################################################################
-# Этот пункт на случай, если человек впервые пользуется сервисом и он не смотрел фильмы
-def popular_films(spark,quan=10):  # входное значение, для определения сколько фильмом человек хочет получить в рекомендации
-    try:
-        datasets = dataset_extract(spark)
-
-        # Проверка наличия данных
-        if datasets:
-            movies, keywords, links, ratings = datasets
-        else:
-            # Обработка ошибки, если что-то пошло не так при чтении данных
-            print('Произошла ошибка при чтении данных. Пожалуйста, проверьте пути к файлам и их формат.')
-
-        cleaned_movies1 = movies.select(['original_title', 'popularity', 'vote_average'])
+        movies = movies.withColumn("id", col("id").cast("integer"))
+        cleaned_movies1 = movies.select(['id', 'original_title', 'popularity', 'vote_average'])
         cleaned_movies2 = cleaned_movies1.withColumn('popularity', cleaned_movies1['popularity'].cast(
             'float'))  # преобразование к типу float для корректных манипуляций
 
@@ -161,39 +130,52 @@ def popular_films(spark,quan=10):  # входное значение, для о�
         cleaned_movies4 = cleaned_movies3.withColumn('vote_average',
                                                      regexp_replace(col('vote_average'), '[^0-9.]', '')).filter(
             col('vote_average').isNotNull())
-        cleaned_movies5 = cleaned_movies4.filter(
+        # Итоговое соединение и фильтрация
+        keywords_x_movies = filtered_common_keywords_limited.join(broadcast(cleaned_movies4),
+                                                                  filtered_common_keywords_limited.recommend_id == cleaned_movies3.id,
+                                                                  'left')
+        intern_rec = keywords_x_movies.select(filtered_common_keywords_limited['id'], 'recommend_id',
+                                              'original_title').filter(
+            col('vote_average').cast('float') >= 6.5)
+        movies_recommend = intern_rec.filter(col('vote_average').isNotNull())
+        ######################################################################################
+        # Этот пункт на случай, если человек впервые пользуется сервисом и он не смотрел фильмы
+        popular_films = cleaned_movies4.filter(
             (col('popularity') >= 10.0) & (col('vote_average').cast('float') <= 10.0)).sort(
-            col('popularity').desc())  # считаем фильм неактуальным при его популярности ниже 10 и
-        # убираем ошибки, где средняя оценка больше 10
+            col('popularity').desc())  # считаем фильм неактуальным при его популярности ниже 10 и убираем ошибки, где средняя оценка больше 10
 
-        cleaned_movies5.show(quan)
-        return cleaned_movies5
-
+        return sorted_common_keywords, user_ratings, movies_recommend, popular_films
     except AnalysisException as e:
-        print(f'Ошибка при выполнении функции: {str(e)}')
+        print(f'Ошибка при трансформации данных: {str(e)}')
         return None
 
 
-def recommendation_of_movies(user_id,spark):
+######################################################################################
+# Этот пункт на случай, если человек впервые пользуется сервисом и он не смотрел фильмы
+
+
+def recommendation_of_movies(user_id, spark):
     try:
         # Загрузка данных
         datasets = dataset_extract(spark)
 
         if datasets:
-            movies, keywords,   links, ratings = datasets
+            movies, keywords, links, ratings = datasets
 
             # Трансформация данных
-            sorted_common_keywords, user_ratings, final = dataset_transform(keywords, ratings, links, spark)
+            sorted_common_keywords, user_ratings, movies_recommend, popular_films = dataset_transform(movies, keywords,
+                                                                                                      ratings, links,
+                                                                                                      spark)
 
             # Фильтрация результатов для конкретного пользователя
-            user_recommendations = final.filter(col('id') == user_id)
+            user_recommendations = movies_recommend.filter(col('id') == int(user_id))
 
             # Если пользователю не подобрало ни 1 фильма среди ключевых слов или он первый раз пользуется сервисом -- ему предлагают самые популярные фильмы
             if user_recommendations.count() > 0:
                 # Вывод результатов
                 user_recommendations.show()
             else:
-                popular_films(10)
+                popular_films.show()
 
 
 
@@ -201,7 +183,6 @@ def recommendation_of_movies(user_id,spark):
     except AnalysisException as e:
         print(f'Ошибка при выполнении функции: {str(e)}')
 
-
 # Пример вызова функции
-#recommendation_of_movies(13)
-#recommendation_of_movies(1)
+# recommendation_of_movies(13)
+# recommendation_of_movies(1)
